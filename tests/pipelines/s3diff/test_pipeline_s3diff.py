@@ -264,6 +264,57 @@ class S3DiffPipelineFastTests(unittest.TestCase):
 
         self.assertIsNotNone(output.images)
 
+    def test_load_de_net_weights_from_local_file(self):
+        """Test load_de_net_weights with a local .pth checkpoint."""
+        components = get_dummy_components()
+        pipe = S3DiffPipeline(**components)
+        pipe = pipe.to(torch_device)
+
+        # Save a DEResNet state-dict to a temp file and load it back
+        de_net = DEResNet(num_in_ch=3, num_degradation=2)
+        with tempfile.NamedTemporaryFile(suffix=".pth", delete=False) as f:
+            tmp_path = f.name
+        try:
+            torch.save(de_net.state_dict(), tmp_path)
+            pipe.load_de_net_weights(tmp_path)
+            self.assertIsNotNone(pipe.de_net)
+            self.assertIsInstance(pipe.de_net, DEResNet)
+        finally:
+            os.unlink(tmp_path)
+
+    def test_load_de_net_weights_from_directory(self):
+        """Test load_de_net_weights with a directory path and filename."""
+        components = get_dummy_components()
+        pipe = S3DiffPipeline(**components)
+        pipe = pipe.to(torch_device)
+
+        de_net = DEResNet(num_in_ch=3, num_degradation=2)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ckpt_path = os.path.join(tmpdir, "de_net.pth")
+            torch.save(de_net.state_dict(), ckpt_path)
+            pipe.load_de_net_weights(tmpdir, filename="de_net.pth")
+            self.assertIsNotNone(pipe.de_net)
+
+    def test_load_de_net_weights_inference_uses_de_net(self):
+        """Test that after loading DEResNet weights, inference uses it automatically."""
+        components = get_dummy_components()
+        pipe = S3DiffPipeline(**components)
+        pipe = pipe.to(torch_device)
+        pipe.set_progress_bar_config(disable=True)
+
+        de_net = DEResNet(num_in_ch=3, num_degradation=2)
+        with tempfile.NamedTemporaryFile(suffix=".pth", delete=False) as f:
+            tmp_path = f.name
+        try:
+            torch.save(de_net.state_dict(), tmp_path)
+            pipe.load_de_net_weights(tmp_path)
+
+            inputs = get_dummy_inputs(torch_device)
+            output = pipe(**inputs)
+            self.assertIsNotNone(output.images)
+        finally:
+            os.unlink(tmp_path)
+
 
 @require_torch
 class DEResNetTests(unittest.TestCase):

@@ -111,10 +111,10 @@ def _s3diff_lora_forward(self, x: torch.Tensor, *args: Any, **kwargs: Any) -> to
                 _tmp = lora_A(dropout(x))
                 if isinstance(lora_A, nn.Conv2d):
                     # _tmp: (B, rank, H, W); de_mod: (B, rank_in, rank_out)
-                    _tmp = torch.einsum("bkhw,bkr->brhw", _tmp, self.de_mod)
+                    _tmp = torch.einsum("...khw,...kr->...rhw", _tmp, self.de_mod)
                 elif isinstance(lora_A, nn.Linear):
-                    # _tmp: (..., rank); de_mod: (B, rank_in, rank_out)
-                    _tmp = torch.einsum("...lk,bkr->...lr", _tmp, self.de_mod)
+                    # _tmp: (..., seq, rank); de_mod: (B, rank_in, rank_out)
+                    _tmp = torch.einsum("...lk,...kr->...lr", _tmp, self.de_mod)
                 else:
                     raise NotImplementedError(
                         f"Only Conv2d and Linear layers are supported in _s3diff_lora_forward, "
@@ -392,6 +392,52 @@ class S3DiffPipeline(DiffusionPipeline):
         self._lora_applied = True
         logger.info("S3Diff weights loaded successfully.")
 
+    def load_de_net_weights(self, pretrained_path: str, filename: str = "de_net.pth") -> None:
+        """Load DEResNet degradation-estimation weights from a local file or HuggingFace Hub.
+
+        After calling this method, the ``de_net`` component will automatically estimate
+        per-image degradation scores during inference instead of using all-zero scores.
+
+        Args:
+            pretrained_path (str): Path to a local ``.pth`` file, a local directory, or a
+                HuggingFace Hub repo ID (e.g. ``"zhangap/S3Diff"``).
+            filename (str): Filename within the directory or Hub repo. Default: ``"de_net.pth"``.
+
+        Example:
+            ```python
+            pipe.load_de_net_weights("zhangap/S3Diff")
+            # or from a local path:
+            pipe.load_de_net_weights("/path/to/checkpoints", filename="de_net.pth")
+            ```
+        """
+        import os
+
+        if os.path.isfile(pretrained_path):
+            ckpt_path = pretrained_path
+        elif os.path.isdir(pretrained_path):
+            ckpt_path = os.path.join(pretrained_path, filename)
+        else:
+            # Try HuggingFace Hub
+            from huggingface_hub import hf_hub_download
+
+            ckpt_path = hf_hub_download(repo_id=pretrained_path, filename=filename)
+
+        logger.info(f"Loading DEResNet weights from {ckpt_path}")
+
+        if self.de_net is None:
+            from .modeling_de_net import DEResNet
+
+            self.de_net = DEResNet(num_in_ch=3, num_degradation=2)
+            # Move to the same device/dtype as the rest of the pipeline
+            device = self._execution_device
+            dtype = next(self.unet.parameters()).dtype
+            self.de_net = self.de_net.to(device=device, dtype=dtype)
+
+        state_dict = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+        self.de_net.load_state_dict(state_dict, strict=True)
+        self.de_net.eval()
+        logger.info("DEResNet weights loaded successfully.")
+
     # ------------------------------------------------------------------
     # Degradation modulation helpers
     # ------------------------------------------------------------------
@@ -608,11 +654,12 @@ class S3DiffPipeline(DiffusionPipeline):
         # ---- Encode image to latent space ----------------------------
         lq_latent = self.vae.encode(image_norm).latent_dist.sample() * self.vae.config.scaling_factor
 
-        # Set up the scheduler for 1-step inference at timestep 999.
-        # We explicitly set the scheduler's timestep list to [999] so that
-        # DDPMScheduler.step can look up the previous timestep correctly.
-        self.scheduler.set_timesteps(self.scheduler.config.num_train_timesteps, device=device)
-        timesteps = torch.tensor([999], device=device, dtype=torch.long)
+        # Set up the scheduler for 1-step inference.
+        # set_timesteps(1) produces a single timestep at 999 and configures the
+        # scheduler's step to go from t=999 directly to t=-1 (fully denoised),
+        # exactly matching the original S3Diff training setup.
+        self.scheduler.set_timesteps(1, device=device)
+        timesteps = self.scheduler.timesteps  # tensor([999], device=device)
         timesteps = timesteps.expand(batch_size * num_images_per_prompt)
 
         # ---- UNet prediction (with optional tiling) ------------------
