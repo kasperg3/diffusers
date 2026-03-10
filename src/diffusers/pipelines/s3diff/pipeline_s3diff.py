@@ -19,7 +19,6 @@ Original code: https://github.com/ArcticHare105/S3Diff
 """
 
 import math
-import re
 from typing import Any, Callable, List, Optional, Union
 
 import numpy as np
@@ -185,9 +184,6 @@ class S3DiffAdapter(ModelMixin, ConfigMixin):
             Tuple[torch.Tensor, torch.Tensor]: ``(vae_embeds, unet_embeds)`` with shapes
                 ``(B, num_vae_blocks, rank_vae^2)`` and ``(B, num_unet_blocks, rank_unet^2)``.
         """
-        rank_vae = self.config.lora_rank_vae
-        rank_unet = self.config.lora_rank_unet
-
         # Fourier encoding: (B, 2) → (B, 4 * num_embeddings)
         deg_proj = deg_score[..., None] * self.W[None, None, :] * 2 * math.pi
         deg_proj = torch.cat([torch.sin(deg_proj), torch.cos(deg_proj)], dim=-1)

@@ -18,7 +18,6 @@ import copy
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 from ...configuration_utils import ConfigMixin, register_to_config
 from ...models.modeling_utils import ModelMixin
@@ -81,7 +80,7 @@ class ResidualBlockNoBN(nn.Module):
         return identity + out * self.res_scale
 
 
-class DEResNet(nn.Module):
+class DEResNet(ModelMixin, ConfigMixin):
     """Degradation Estimator with ResNet (no BN) architecture.
 
     Estimates degradation scores (e.g., blur and noise levels) from an input image.
@@ -97,6 +96,7 @@ class DEResNet(nn.Module):
         downscales (list[int]): Downscale factors per stage (1=no downscale, 2=2x). Default: [1, 1, 2, 1].
     """
 
+    @register_to_config
     def __init__(
         self,
         num_in_ch=3,
