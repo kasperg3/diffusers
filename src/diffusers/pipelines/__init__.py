@@ -327,6 +327,7 @@ else:
         "SanaVideoPipeline",
         "SanaImageToVideoPipeline",
     ]
+    _import_structure["s3diff"] = ["DEResNet", "S3DiffAdapter", "S3DiffPipeline"]
     _import_structure["semantic_stable_diffusion"] = ["SemanticStableDiffusionPipeline"]
     _import_structure["shap_e"] = ["ShapEImg2ImgPipeline", "ShapEPipeline"]
     _import_structure["stable_audio"] = [
@@ -790,6 +791,7 @@ if TYPE_CHECKING or DIFFUSERS_SLOW_IMPORT:
             SanaSprintPipeline,
         )
         from .sana_video import SanaImageToVideoPipeline, SanaVideoPipeline
+        from .s3diff import DEResNet, S3DiffAdapter, S3DiffPipeline
         from .semantic_stable_diffusion import SemanticStableDiffusionPipeline
         from .shap_e import ShapEImg2ImgPipeline, ShapEPipeline
         from .stable_audio import StableAudioPipeline, StableAudioProjectionModel
