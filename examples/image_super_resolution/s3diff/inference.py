@@ -223,8 +223,8 @@ def main():
         # 'adain' and 'none' are intentionally left for users to extend
 
         fname = os.path.splitext(os.path.basename(img_path))[0]
-        out_path = os.path.join(args.output, f"{fname}_x{args.scale_factor}.png")
-        result.save(out_path)
+        out_path = os.path.join(args.output, f"{fname}_x{args.scale_factor}.jpg")
+        result.save(out_path, quality=95)
         print(f"  Saved → {out_path}")
 
     print("Done.")

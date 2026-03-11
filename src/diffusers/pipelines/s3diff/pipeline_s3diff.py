@@ -801,12 +801,17 @@ class S3DiffPipeline(DiffusionPipeline):
     # ------------------------------------------------------------------
 
     def _gaussian_weights(
-        self, tile_width: int, tile_height: int, nbatches: int, device: torch.device, dtype: torch.dtype
+        self, tile_width: int, tile_height: int, nbatches: int, device: torch.device
     ) -> torch.Tensor:
-        """Generate a 2-D Gaussian weight mask for tile blending."""
+        """Generate a 2-D Gaussian weight mask for tile blending.
+
+        Always computed in fp32 to avoid underflow with small variance values
+        in fp16/bf16 (the peaked Gaussian with var=0.01 produces values < 1e-5
+        at tile edges, which underflow to zero in half precision).
+        """
         var = 0.01
         midpoint_x = (tile_width - 1) / 2.0
-        midpoint_y = tile_height / 2.0
+        midpoint_y = (tile_height - 1) / 2.0
         x_probs = [
             math.exp(-((x - midpoint_x) ** 2) / (tile_width**2) / (2 * var))
             / math.sqrt(2 * math.pi * var)
@@ -817,7 +822,7 @@ class S3DiffPipeline(DiffusionPipeline):
             / math.sqrt(2 * math.pi * var)
             for y in range(tile_height)
         ]
-        weights = torch.tensor(np.outer(y_probs, x_probs), dtype=dtype, device=device)
+        weights = torch.tensor(np.outer(y_probs, x_probs), dtype=torch.float32, device=device)
         return weights.unsqueeze(0).unsqueeze(0).expand(nbatches, self.unet.config.in_channels, -1, -1)
 
     def _tiled_unet_forward(
@@ -831,13 +836,17 @@ class S3DiffPipeline(DiffusionPipeline):
     ):
         """Run UNet inference using tiling for large latents.
 
+        Accumulation is done in fp32 to prevent numerical issues when the
+        model runs in fp16/bf16.
+
         Returns:
             Tuple of ``(pos_model_pred, neg_model_pred)`` where ``neg_model_pred``
             is ``None`` when ``neg_embeds`` is ``None``.
         """
+        input_dtype = lq_latent.dtype
         _, _, h, w = lq_latent.shape
         tile_size = min(tile_size, min(h, w))
-        tile_weights = self._gaussian_weights(tile_size, tile_size, 1, lq_latent.device, lq_latent.dtype)
+        tile_weights = self._gaussian_weights(tile_size, tile_size, 1, lq_latent.device)
 
         def _compute_grid(dim_size):
             count, cur = 0, 0
@@ -849,9 +858,10 @@ class S3DiffPipeline(DiffusionPipeline):
         grid_cols = _compute_grid(h)
         grid_rows = _compute_grid(w)
 
-        pos_noise_pred = torch.zeros_like(lq_latent)
-        neg_noise_pred = torch.zeros_like(lq_latent) if neg_embeds is not None else None
-        contributors = torch.zeros_like(lq_latent)
+        # Accumulate in fp32 to avoid precision loss
+        pos_noise_pred = torch.zeros(*lq_latent.shape, device=lq_latent.device, dtype=torch.float32)
+        neg_noise_pred = torch.zeros_like(pos_noise_pred) if neg_embeds is not None else None
+        contributors = torch.zeros_like(pos_noise_pred)
 
         for row in range(grid_rows):
             for col in range(grid_cols):
@@ -867,11 +877,11 @@ class S3DiffPipeline(DiffusionPipeline):
                 tile = lq_latent[:, :, sy:ey, sx:ex]
 
                 pos_out = self.unet(tile, timesteps, encoder_hidden_states=pos_embeds).sample
-                pos_noise_pred[:, :, sy:ey, sx:ex] += pos_out * tile_weights
+                pos_noise_pred[:, :, sy:ey, sx:ex] += pos_out.float() * tile_weights
 
                 if neg_embeds is not None:
                     neg_out = self.unet(tile, timesteps, encoder_hidden_states=neg_embeds).sample
-                    neg_noise_pred[:, :, sy:ey, sx:ex] += neg_out * tile_weights
+                    neg_noise_pred[:, :, sy:ey, sx:ex] += neg_out.float() * tile_weights
 
                 contributors[:, :, sy:ey, sx:ex] += tile_weights
 
@@ -879,4 +889,4 @@ class S3DiffPipeline(DiffusionPipeline):
         if neg_noise_pred is not None:
             neg_noise_pred /= contributors
 
-        return pos_noise_pred, neg_noise_pred
+        return pos_noise_pred.to(input_dtype), neg_noise_pred.to(input_dtype) if neg_noise_pred is not None else None
