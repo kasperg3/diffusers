@@ -399,9 +399,28 @@ class S3DiffPipelineFastTests(unittest.TestCase):
             pipe2 = pipe2.to(torch_device)
             pipe2.load_s3diff_weights(tmp_path)
             self.assertTrue(pipe2._lora_applied)
+            # All LoRA parameters must be on the correct device after loading
+            # (PEFT initialises LoRA weights on CPU; load_s3diff_weights must
+            # move them back to torch_device).
+            expected_device_type = str(torch_device).split(":")[0]
+            for name, param in pipe2.vae.named_parameters():
+                self.assertEqual(
+                    str(param.device).split(":")[0],
+                    expected_device_type,
+                    f"VAE param '{name}' is on {param.device} instead of {torch_device}",
+                )
+            for name, param in pipe2.unet.named_parameters():
+                self.assertEqual(
+                    str(param.device).split(":")[0],
+                    expected_device_type,
+                    f"UNet param '{name}' is on {param.device} instead of {torch_device}",
+                )
         finally:
             os.unlink(tmp_path)
 
+
+@require_torch
+class DEResNetTests(unittest.TestCase):
     """Unit tests for the DEResNet degradation estimation model."""
 
     def test_de_resnet_instantiation(self):

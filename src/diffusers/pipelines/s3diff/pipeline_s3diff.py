@@ -352,6 +352,12 @@ class S3DiffPipeline(DiffusionPipeline):
         # because the file is downloaded from the known-good zhangap/S3Diff Hub repo.
         sd = torch.load(ckpt_path, map_location="cpu", weights_only=False)
 
+        # Capture device/dtype from the base model BEFORE add_adapter, because PEFT
+        # adds new LoRA parameters (initialized on CPU by default) which would corrupt
+        # next(self.unet.parameters()).device if checked afterwards.
+        device = self._execution_device
+        dtype = next(self.unet.parameters()).dtype
+
         # ---- VAE LoRA ------------------------------------------------
         rank_vae = sd["rank_vae"]
         vae_target_modules = sd["vae_lora_target_modules"]
@@ -378,6 +384,8 @@ class S3DiffPipeline(DiffusionPipeline):
                 f"{skipped_vae[:3]}{'...' if len(skipped_vae) > 3 else ''}"
             )
         self.vae.load_state_dict(_sd_vae)
+        # PEFT initialises LoRA weights on CPU; move everything back to the target device.
+        self.vae.to(device=device, dtype=dtype)
 
         # ---- UNet LoRA -----------------------------------------------
         rank_unet = sd["rank_unet"]
@@ -404,13 +412,13 @@ class S3DiffPipeline(DiffusionPipeline):
                 f"{skipped_unet[:3]}{'...' if len(skipped_unet) > 3 else ''}"
             )
         self.unet.load_state_dict(_sd_unet)
+        # Same reason as VAE: move everything back after PEFT potentially left some on CPU.
+        self.unet.to(device=device, dtype=dtype)
 
         # ---- S3Diff MLP / Embedding weights --------------------------
         # Infer all adapter dimensions directly from the checkpoint so that the
         # adapter is always built with the exact right shape, regardless of what
         # values the user's environment defaults to.
-        device = next(self.unet.parameters()).device
-        dtype = next(self.unet.parameters()).dtype
         embeddings = sd["state_embeddings"]
         num_vae_blocks = embeddings["state_dict_vae_block"]["weight"].shape[0]
         num_unet_blocks = embeddings["state_dict_unet_block"]["weight"].shape[0]
@@ -477,13 +485,13 @@ class S3DiffPipeline(DiffusionPipeline):
 
         logger.info(f"Loading DEResNet weights from {ckpt_path}")
 
+        device = self._execution_device
+        dtype = next(self.unet.parameters()).dtype
+
         if self.de_net is None:
             from .modeling_de_net import DEResNet
 
             self.de_net = DEResNet(num_in_ch=3, num_degradation=2)
-            # Move to the same device/dtype as the rest of the pipeline
-            device = self._execution_device
-            dtype = next(self.unet.parameters()).dtype
             self.de_net = self.de_net.to(device=device, dtype=dtype)
 
         # The de_net.pth checkpoint is a plain state dict of tensors, so
@@ -494,6 +502,9 @@ class S3DiffPipeline(DiffusionPipeline):
         except (RuntimeError, pickle.UnpicklingError):
             state_dict = torch.load(ckpt_path, map_location="cpu", weights_only=False)
         self.de_net.load_state_dict(state_dict, strict=True)
+        # load_state_dict with map_location="cpu" may have moved weights to CPU;
+        # explicitly restore the correct device/dtype.
+        self.de_net.to(device=device, dtype=dtype)
         self.de_net.eval()
         logger.info("DEResNet weights loaded successfully.")
 
