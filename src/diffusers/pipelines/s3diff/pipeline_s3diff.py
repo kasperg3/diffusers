@@ -234,15 +234,17 @@ class S3DiffPipeline(DiffusionPipeline):
             A ``UNet2DConditionModel`` to denoise the encoded image latents.
         scheduler ([`DDPMScheduler`]):
             A ``DDPMScheduler`` configured for one-step inference.
-        s3diff_adapter ([`S3DiffAdapter`]):
+        s3diff_adapter ([`S3DiffAdapter`], *optional*):
             The S3Diff degradation-guidance adapter containing the MLPs and embeddings.
+            If ``None``, a default adapter is created automatically; it will be replaced
+            with a correctly-sized one when :meth:`load_s3diff_weights` is called.
         de_net ([`~pipelines.s3diff.DEResNet`], *optional*):
             Degradation estimation network. When provided, degradation scores are
             estimated automatically from the input image.
     """
 
     model_cpu_offload_seq = "text_encoder->unet->vae"
-    _optional_components = ["de_net"]
+    _optional_components = ["de_net", "s3diff_adapter"]
 
     def __init__(
         self,
@@ -251,10 +253,17 @@ class S3DiffPipeline(DiffusionPipeline):
         tokenizer: CLIPTokenizer,
         unet: UNet2DConditionModel,
         scheduler: DDPMScheduler,
-        s3diff_adapter: S3DiffAdapter,
+        s3diff_adapter: Optional[S3DiffAdapter] = None,
         de_net: Optional[DEResNet] = None,
     ):
         super().__init__()
+
+        # Create a default adapter when none is provided (e.g. loading from a
+        # base SD-Turbo repo that does not bundle an s3diff_adapter).  The
+        # ranks will be updated to the correct values when
+        # ``load_s3diff_weights`` is called.
+        if s3diff_adapter is None:
+            s3diff_adapter = S3DiffAdapter()
 
         self.register_modules(
             vae=vae,
@@ -372,6 +381,15 @@ class S3DiffPipeline(DiffusionPipeline):
         self.unet.load_state_dict(_sd_unet)
 
         # ---- S3Diff MLP / Embedding weights --------------------------
+        # Rebuild the adapter with ranks matching the checkpoint so that
+        # the output dimension of the fuse MLPs (rank^2) is correct.
+        device = next(self.unet.parameters()).device
+        dtype = next(self.unet.parameters()).dtype
+        self.s3diff_adapter = S3DiffAdapter(
+            lora_rank_unet=rank_unet,
+            lora_rank_vae=rank_vae,
+        ).to(device=device, dtype=dtype)
+
         self.s3diff_adapter.vae_de_mlp.load_state_dict(sd["state_dict_vae_de_mlp"])
         self.s3diff_adapter.unet_de_mlp.load_state_dict(sd["state_dict_unet_de_mlp"])
         self.s3diff_adapter.vae_block_mlp.load_state_dict(sd["state_dict_vae_block_mlp"])
@@ -379,16 +397,12 @@ class S3DiffPipeline(DiffusionPipeline):
         self.s3diff_adapter.vae_fuse_mlp.load_state_dict(sd["state_dict_vae_fuse_mlp"])
         self.s3diff_adapter.unet_fuse_mlp.load_state_dict(sd["state_dict_unet_fuse_mlp"])
 
-        device = self.s3diff_adapter.W.device
         self.s3diff_adapter.W.data.copy_(sd["w"].to(device))
 
         embeddings = sd["state_embeddings"]
         self.s3diff_adapter.vae_block_embeddings.load_state_dict(embeddings["state_dict_vae_block"])
         self.s3diff_adapter.unet_block_embeddings.load_state_dict(embeddings["state_dict_unet_block"])
 
-        # Update config to reflect actual loaded ranks
-        self.s3diff_adapter.config.lora_rank_unet = rank_unet
-        self.s3diff_adapter.config.lora_rank_vae = rank_vae
         self._lora_applied = True
         logger.info("S3Diff weights loaded successfully.")
 
@@ -593,9 +607,13 @@ class S3DiffPipeline(DiffusionPipeline):
             image = [image]
 
         if isinstance(image, list) and isinstance(image[0], PIL.Image.Image):
-            import torchvision.transforms.functional as TF
-
-            image = torch.stack([TF.to_tensor(img.convert("RGB")) for img in image], dim=0)
+            image = torch.stack(
+                [
+                    torch.from_numpy(np.array(img.convert("RGB"))).permute(2, 0, 1).float() / 255.0
+                    for img in image
+                ],
+                dim=0,
+            )
         elif isinstance(image, np.ndarray):
             if image.ndim == 3:
                 image = image[None]
@@ -701,9 +719,10 @@ class S3DiffPipeline(DiffusionPipeline):
         output_image = output_image * 0.5 + 0.5
 
         if output_type == "pil":
-            import torchvision.transforms.functional as TF
-
-            output = [TF.to_pil_image(img.clamp(0, 1)) for img in output_image]
+            output = []
+            for img in output_image:
+                arr = (img.clamp(0, 1).permute(1, 2, 0).cpu().float().numpy() * 255).astype(np.uint8)
+                output.append(PIL.Image.fromarray(arr))
         else:
             output = output_image
 

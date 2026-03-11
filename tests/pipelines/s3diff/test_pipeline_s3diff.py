@@ -122,6 +122,34 @@ class S3DiffPipelineFastTests(unittest.TestCase):
         pipe = S3DiffPipeline(**components)
         self.assertIsInstance(pipe, S3DiffPipeline)
 
+    def test_pipeline_instantiated_without_adapter(self):
+        """Test that the pipeline auto-creates a default S3DiffAdapter when none is provided.
+
+        This simulates the common usage pattern of calling
+        ``S3DiffPipeline.from_pretrained("stabilityai/sd-turbo")`` where the base
+        SD-Turbo model has no ``s3diff_adapter`` in its ``model_index.json``,
+        causing diffusers to pass ``None`` for that component.
+        """
+        components = get_dummy_components()
+        components["s3diff_adapter"] = None  # Simulate from_pretrained without adapter
+        pipe = S3DiffPipeline(**components)
+        self.assertIsInstance(pipe, S3DiffPipeline)
+        # A default adapter should have been created automatically
+        self.assertIsNotNone(pipe.s3diff_adapter)
+        self.assertIsInstance(pipe.s3diff_adapter, S3DiffAdapter)
+
+    def test_pipeline_forward_without_adapter(self):
+        """Test that inference works after auto-creating the default adapter."""
+        components = get_dummy_components()
+        components["s3diff_adapter"] = None
+        pipe = S3DiffPipeline(**components)
+        pipe = pipe.to(torch_device)
+        pipe.set_progress_bar_config(disable=True)
+
+        inputs = get_dummy_inputs(torch_device)
+        output = pipe(**inputs)
+        self.assertIsNotNone(output.images)
+
     def test_pipeline_has_expected_components(self):
         """Test that the pipeline registers all expected module components."""
         components = get_dummy_components()
