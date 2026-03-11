@@ -342,10 +342,66 @@ class S3DiffPipelineFastTests(unittest.TestCase):
             self.assertIsNotNone(output.images)
         finally:
             os.unlink(tmp_path)
+    def test_load_s3diff_weights_from_local_file(self):
+        """Test load_s3diff_weights with a minimal mock checkpoint (PyTorch 2.6+ weights_only fix)."""
+        try:
+            from peft import LoraConfig
+        except ImportError:
+            self.skipTest("PEFT not installed")
 
+        components = get_dummy_components()
+        pipe = S3DiffPipeline(**components)
+        pipe = pipe.to(torch_device)
 
-@require_torch
-class DEResNetTests(unittest.TestCase):
+        # Apply minimal PEFT LoRA to VAE and UNet (tiny rank, minimal target modules)
+        rank = 2
+        target_modules_vae = ["to_q"]
+        target_modules_unet = ["to_q"]
+        vae_lora_config = LoraConfig(r=rank, init_lora_weights="gaussian", target_modules=target_modules_vae)
+        unet_lora_config = LoraConfig(r=rank, init_lora_weights="gaussian", target_modules=target_modules_unet)
+        pipe.vae.add_adapter(vae_lora_config, adapter_name="vae_skip")
+        pipe.unet.add_adapter(unet_lora_config)
+
+        # Build a minimal mock checkpoint matching the original s3diff.pkl structure
+        import torch.nn as nn
+
+        W_param = nn.Parameter(torch.randn(4))  # nn.Parameter (as in original save_model)
+        vae_sd_partial = {k: v.clone() for k, v in pipe.vae.state_dict().items() if "lora" in k}
+        unet_sd_partial = {k: v.clone() for k, v in pipe.unet.state_dict().items() if "lora" in k}
+        adapter = S3DiffAdapter(lora_rank_unet=rank, lora_rank_vae=rank, num_embeddings=4)
+
+        mock_sd = {
+            "rank_vae": rank,
+            "rank_unet": rank,
+            "vae_lora_target_modules": target_modules_vae,
+            "unet_lora_target_modules": target_modules_unet,
+            "state_dict_vae": vae_sd_partial,
+            "state_dict_unet": unet_sd_partial,
+            "state_dict_vae_de_mlp": adapter.vae_de_mlp.state_dict(),
+            "state_dict_unet_de_mlp": adapter.unet_de_mlp.state_dict(),
+            "state_dict_vae_block_mlp": adapter.vae_block_mlp.state_dict(),
+            "state_dict_unet_block_mlp": adapter.unet_block_mlp.state_dict(),
+            "state_dict_vae_fuse_mlp": adapter.vae_fuse_mlp.state_dict(),
+            "state_dict_unet_fuse_mlp": adapter.unet_fuse_mlp.state_dict(),
+            "w": W_param,  # saved as nn.Parameter, as in original code
+            "state_embeddings": {
+                "state_dict_vae_block": adapter.vae_block_embeddings.state_dict(),
+                "state_dict_unet_block": adapter.unet_block_embeddings.state_dict(),
+            },
+        }
+
+        with tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as f:
+            tmp_path = f.name
+        try:
+            torch.save(mock_sd, tmp_path)
+            # Reset so load_s3diff_weights starts fresh
+            pipe2 = S3DiffPipeline(**get_dummy_components())
+            pipe2 = pipe2.to(torch_device)
+            pipe2.load_s3diff_weights(tmp_path)
+            self.assertTrue(pipe2._lora_applied)
+        finally:
+            os.unlink(tmp_path)
+
     """Unit tests for the DEResNet degradation estimation model."""
 
     def test_de_resnet_instantiation(self):

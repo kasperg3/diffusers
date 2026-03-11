@@ -19,6 +19,7 @@ Original code: https://github.com/ArcticHare105/S3Diff
 """
 
 import math
+import pickle
 from typing import Any, Callable, List, Optional, Union
 
 import numpy as np
@@ -346,7 +347,10 @@ class S3DiffPipeline(DiffusionPipeline):
             ckpt_path = hf_hub_download(repo_id=pretrained_path, filename=filename)
 
         logger.info(f"Loading S3Diff weights from {ckpt_path}")
-        sd = torch.load(ckpt_path, map_location="cpu")
+        # The checkpoint is a pickle file (saved with torch.save) that may contain
+        # nn.Parameter objects, so weights_only=False is required.  This is safe
+        # because the file is downloaded from the known-good zhangap/S3Diff Hub repo.
+        sd = torch.load(ckpt_path, map_location="cpu", weights_only=False)
 
         # ---- VAE LoRA ------------------------------------------------
         rank_vae = sd["rank_vae"]
@@ -358,10 +362,21 @@ class S3DiffPipeline(DiffusionPipeline):
         )
         self._apply_lora_to_vae(vae_lora_config)
 
-        # Restore VAE state
+        # Restore VAE LoRA state: only update keys that exist in the current
+        # model (guarding against PEFT version differences in key naming).
         _sd_vae = self.vae.state_dict()
+        skipped_vae = []
         for k, v in sd["state_dict_vae"].items():
-            _sd_vae[k] = v
+            if k in _sd_vae:
+                _sd_vae[k] = v
+            else:
+                skipped_vae.append(k)
+        if skipped_vae:
+            logger.warning(
+                f"Skipped {len(skipped_vae)} VAE checkpoint key(s) not found in "
+                f"the current model (possibly a PEFT version mismatch): "
+                f"{skipped_vae[:3]}{'...' if len(skipped_vae) > 3 else ''}"
+            )
         self.vae.load_state_dict(_sd_vae)
 
         # ---- UNet LoRA -----------------------------------------------
@@ -374,20 +389,45 @@ class S3DiffPipeline(DiffusionPipeline):
         )
         self._apply_lora_to_unet(unet_lora_config)
 
-        # Restore UNet state
+        # Restore UNet LoRA state (same safe key-matching approach as VAE).
         _sd_unet = self.unet.state_dict()
+        skipped_unet = []
         for k, v in sd["state_dict_unet"].items():
-            _sd_unet[k] = v
+            if k in _sd_unet:
+                _sd_unet[k] = v
+            else:
+                skipped_unet.append(k)
+        if skipped_unet:
+            logger.warning(
+                f"Skipped {len(skipped_unet)} UNet checkpoint key(s) not found in "
+                f"the current model (possibly a PEFT version mismatch): "
+                f"{skipped_unet[:3]}{'...' if len(skipped_unet) > 3 else ''}"
+            )
         self.unet.load_state_dict(_sd_unet)
 
         # ---- S3Diff MLP / Embedding weights --------------------------
-        # Rebuild the adapter with ranks matching the checkpoint so that
-        # the output dimension of the fuse MLPs (rank^2) is correct.
+        # Infer all adapter dimensions directly from the checkpoint so that the
+        # adapter is always built with the exact right shape, regardless of what
+        # values the user's environment defaults to.
         device = next(self.unet.parameters()).device
         dtype = next(self.unet.parameters()).dtype
+        embeddings = sd["state_embeddings"]
+        num_vae_blocks = embeddings["state_dict_vae_block"]["weight"].shape[0]
+        num_unet_blocks = embeddings["state_dict_unet_block"]["weight"].shape[0]
+        block_embedding_dim = embeddings["state_dict_vae_block"]["weight"].shape[1]
+        # sd["w"] is saved as nn.Parameter in the original S3Diff save_model(), so
+        # it has a .data attribute.  Handle both nn.Parameter and plain Tensor in
+        # case checkpoints are re-saved in a different format.
+        w_tensor = sd["w"].data if hasattr(sd["w"], "data") else sd["w"]
+        num_embeddings = w_tensor.shape[0]
+
         self.s3diff_adapter = S3DiffAdapter(
             lora_rank_unet=rank_unet,
             lora_rank_vae=rank_vae,
+            num_embeddings=num_embeddings,
+            num_vae_blocks=num_vae_blocks,
+            num_unet_blocks=num_unet_blocks,
+            block_embedding_dim=block_embedding_dim,
         ).to(device=device, dtype=dtype)
 
         self.s3diff_adapter.vae_de_mlp.load_state_dict(sd["state_dict_vae_de_mlp"])
@@ -397,9 +437,8 @@ class S3DiffPipeline(DiffusionPipeline):
         self.s3diff_adapter.vae_fuse_mlp.load_state_dict(sd["state_dict_vae_fuse_mlp"])
         self.s3diff_adapter.unet_fuse_mlp.load_state_dict(sd["state_dict_unet_fuse_mlp"])
 
-        self.s3diff_adapter.W.data.copy_(sd["w"].to(device))
+        self.s3diff_adapter.W.data.copy_(w_tensor.to(device))
 
-        embeddings = sd["state_embeddings"]
         self.s3diff_adapter.vae_block_embeddings.load_state_dict(embeddings["state_dict_vae_block"])
         self.s3diff_adapter.unet_block_embeddings.load_state_dict(embeddings["state_dict_unet_block"])
 
@@ -447,7 +486,13 @@ class S3DiffPipeline(DiffusionPipeline):
             dtype = next(self.unet.parameters()).dtype
             self.de_net = self.de_net.to(device=device, dtype=dtype)
 
-        state_dict = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+        # The de_net.pth checkpoint is a plain state dict of tensors, so
+        # weights_only=True is fine.  Fall back to False for older checkpoints
+        # that may use non-tensor types (e.g. OrderedDict wrappers in older PyTorch).
+        try:
+            state_dict = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+        except (RuntimeError, pickle.UnpicklingError):
+            state_dict = torch.load(ckpt_path, map_location="cpu", weights_only=False)
         self.de_net.load_state_dict(state_dict, strict=True)
         self.de_net.eval()
         logger.info("DEResNet weights loaded successfully.")
