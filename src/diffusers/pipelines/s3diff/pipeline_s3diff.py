@@ -736,14 +736,16 @@ class S3DiffPipeline(DiffusionPipeline):
         # ---- Encode image to latent space ----------------------------
         lq_latent = self.vae.encode(image_norm).latent_dist.sample() * self.vae.config.scaling_factor
 
-        # Set up the scheduler for 1-step inference.
-        # set_timesteps(1) configures num_inference_steps=1 so that the
-        # scheduler.step() goes from t=999 directly to t=-1 (fully denoised).
-        # Note: DDPMScheduler.set_timesteps(1) may produce timestep [0], but
-        # S3Diff was trained with a fixed timestep of 999, so we hardcode it.
+        # Set up the scheduler for 1-step inference at t=999.
+        # S3Diff was trained with a single denoising step from t=999 → t=-1.
+        # DDPMScheduler.set_timesteps(1) produces [0], not [999], so we:
+        # 1. Call set_timesteps to initialise internal state (num_inference_steps, etc.)
+        # 2. Override self.scheduler.timesteps to [999] so that scheduler.step()
+        #    can look up the correct alpha_cumprod values and previous_timestep().
         self.scheduler.set_timesteps(1, device=device)
         self.scheduler.alphas_cumprod = self.scheduler.alphas_cumprod.to(device)
-        timesteps = torch.tensor([999], device=device, dtype=torch.long).expand(batch_size * num_images_per_prompt)
+        self.scheduler.timesteps = torch.tensor([999], device=device, dtype=torch.long)
+        timesteps = self.scheduler.timesteps.expand(batch_size * num_images_per_prompt)
 
         # ---- UNet prediction (with optional tiling) ------------------
         _, _, h, w = lq_latent.shape
