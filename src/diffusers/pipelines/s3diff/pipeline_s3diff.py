@@ -259,6 +259,11 @@ class S3DiffPipeline(DiffusionPipeline):
     ):
         super().__init__()
 
+        # S3Diff requires DDPMScheduler.  SD-Turbo ships with
+        # EulerDiscreteScheduler, so convert automatically when needed.
+        if not isinstance(scheduler, DDPMScheduler):
+            scheduler = DDPMScheduler.from_config(scheduler.config)
+
         # Create a default adapter when none is provided (e.g. loading from a
         # base SD-Turbo repo that does not bundle an s3diff_adapter).  The
         # ranks will be updated to the correct values when
@@ -689,11 +694,14 @@ class S3DiffPipeline(DiffusionPipeline):
         ).contiguous()
 
         # ---- Degradation score estimation ----------------------------
+        # The de_net must receive the upscaled (HR-sized) image in [0, 1] to
+        # match the original S3Diff training setup where the input is already
+        # at target resolution (degraded via downscale + upscale).
         if degradation_score is not None:
             deg_score = degradation_score.to(device=device, dtype=dtype)
         elif self.de_net is not None:
             with torch.no_grad():
-                deg_score = self.de_net(image)
+                deg_score = self.de_net(image_upscaled)
         else:
             deg_score = torch.zeros(batch_size, 2, device=device, dtype=dtype)
 
@@ -729,12 +737,13 @@ class S3DiffPipeline(DiffusionPipeline):
         lq_latent = self.vae.encode(image_norm).latent_dist.sample() * self.vae.config.scaling_factor
 
         # Set up the scheduler for 1-step inference.
-        # set_timesteps(1) produces a single timestep at 999 and configures the
-        # scheduler's step to go from t=999 directly to t=-1 (fully denoised),
-        # exactly matching the original S3Diff training setup.
+        # set_timesteps(1) configures num_inference_steps=1 so that the
+        # scheduler.step() goes from t=999 directly to t=-1 (fully denoised).
+        # Note: DDPMScheduler.set_timesteps(1) may produce timestep [0], but
+        # S3Diff was trained with a fixed timestep of 999, so we hardcode it.
         self.scheduler.set_timesteps(1, device=device)
-        timesteps = self.scheduler.timesteps  # tensor([999], device=device)
-        timesteps = timesteps.expand(batch_size * num_images_per_prompt)
+        self.scheduler.alphas_cumprod = self.scheduler.alphas_cumprod.to(device)
+        timesteps = torch.tensor([999], device=device, dtype=torch.long).expand(batch_size * num_images_per_prompt)
 
         # ---- UNet prediction (with optional tiling) ------------------
         _, _, h, w = lq_latent.shape

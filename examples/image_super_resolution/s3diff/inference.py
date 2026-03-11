@@ -89,13 +89,13 @@ def parse_args():
     parser.add_argument(
         "--pos_prompt",
         type=str,
-        default="",
+        default="A high-resolution, 8K, ultra-realistic image with sharp focus, vibrant colors, and natural lighting.",
         help="Positive text prompt to guide the reconstruction.",
     )
     parser.add_argument(
         "--neg_prompt",
         type=str,
-        default="",
+        default="oil painting, cartoon, blur, dirty, messy, low quality, deformation, low resolution, oversmooth",
         help="Negative text prompt for classifier-free guidance.",
     )
     parser.add_argument(
@@ -168,9 +168,7 @@ def load_image_paths(input_path: str):
         return [input_path]
     if os.path.isdir(input_path):
         return sorted(
-            os.path.join(input_path, f)
-            for f in os.listdir(input_path)
-            if os.path.splitext(f)[1].lower() in supported
+            os.path.join(input_path, f) for f in os.listdir(input_path) if os.path.splitext(f)[1].lower() in supported
         )
     raise FileNotFoundError(f"Input path not found: {input_path}")
 
