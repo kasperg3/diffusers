@@ -20,7 +20,7 @@ Original code: https://github.com/ArcticHare105/S3Diff
 
 import math
 import pickle
-from typing import Any, Callable, List, Optional, Union
+from typing import Any, Callable, List, Optional, Tuple, Union
 
 import numpy as np
 import PIL.Image
@@ -34,7 +34,7 @@ from ...image_processor import PipelineImageInput, VaeImageProcessor
 from ...models import AutoencoderKL, UNet2DConditionModel
 from ...models.modeling_utils import ModelMixin
 from ...schedulers import DDPMScheduler
-from ...utils import is_peft_available, logging
+from ...utils import is_peft_available, logging, replace_example_docstring
 from ..pipeline_utils import DiffusionPipeline, ImagePipelineOutput
 from .modeling_de_net import DEResNet
 
@@ -593,6 +593,7 @@ class S3DiffPipeline(DiffusionPipeline):
     # ------------------------------------------------------------------
 
     @torch.no_grad()
+    @replace_example_docstring(EXAMPLE_DOC_STRING)
     def __call__(
         self,
         image: PipelineImageInput,
@@ -608,7 +609,7 @@ class S3DiffPipeline(DiffusionPipeline):
         return_dict: bool = True,
         callback: Optional[Callable[[int, int, torch.FloatTensor], None]] = None,
         callback_steps: int = 1,
-    ):
+    ) -> Union[ImagePipelineOutput, Tuple]:
         """
         Run one-step image super-resolution with S3Diff.
 
@@ -638,16 +639,18 @@ class S3DiffPipeline(DiffusionPipeline):
             output_type (str):
                 Output format: ``"pil"`` or ``"pt"`` (torch tensor). Default: ``"pil"``.
             return_dict (bool):
-                If ``True``, return an ``ImagePipelineOutput``. Default: ``True``.
+                If ``True``, return an [`ImagePipelineOutput`]. Default: ``True``.
             callback (Callable, *optional*):
                 Callback called after the denoising step.
             callback_steps (int):
                 Frequency of callback calls. Default: 1.
 
+        Examples:
+
         Returns:
-            [`ImagePipelineOutput`] or ``tuple``:
-                A ``ImagePipelineOutput`` with the ``images`` field containing PIL Images,
-                or a tuple of ``(images,)`` if ``return_dict`` is ``False``.
+            [`ImagePipelineOutput`] or `tuple`:
+                If `return_dict` is `True`, [`ImagePipelineOutput`] is returned, otherwise a `tuple` is returned
+                where the first element is a list with the generated images.
         """
         if not self._lora_applied:
             logger.warning(
