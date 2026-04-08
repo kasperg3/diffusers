@@ -71,6 +71,7 @@ The table below lists all the pipelines currently available in 🤗 Diffusers an
 | [PIA](pia) | image2video |
 | [PixArt-α](pixart) | text2image |
 | [PixArt-Σ](pixart_sigma) | text2image |
+| [S3Diff](s3diff) | super-resolution |
 | [Self-Attention Guidance](self_attention_guidance) | text2image |
 | [Semantic Guidance](semantic_stable_diffusion) | text2image |
 | [Shap-E](shap_e) | text-to-3D, image-to-3D |

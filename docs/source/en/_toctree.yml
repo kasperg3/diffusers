@@ -610,6 +610,8 @@
         title: Sana Sprint
       - local: api/pipelines/sana_video
         title: Sana Video
+      - local: api/pipelines/s3diff
+        title: S3Diff
       - local: api/pipelines/self_attention_guidance
         title: Self-Attention Guidance
       - local: api/pipelines/semantic_stable_diffusion
