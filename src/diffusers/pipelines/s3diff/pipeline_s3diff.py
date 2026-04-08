@@ -27,6 +27,8 @@ import PIL.Image
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from fliser import Fliser
+from tqdm import tqdm
 from transformers import CLIPTextModel, CLIPTokenizer
 
 from ...configuration_utils import ConfigMixin, register_to_config
@@ -204,9 +206,7 @@ class S3DiffAdapter(ModelMixin, ConfigMixin):
             torch.cat([vae_de.unsqueeze(1).expand(-1, n_vae, -1), vae_blk.unsqueeze(0).expand(B, -1, -1)], dim=-1)
         )  # (B, n_vae, rank_vae^2)
         unet_embeds = self.unet_fuse_mlp(
-            torch.cat(
-                [unet_de.unsqueeze(1).expand(-1, n_unet, -1), unet_blk.unsqueeze(0).expand(B, -1, -1)], dim=-1
-            )
+            torch.cat([unet_de.unsqueeze(1).expand(-1, n_unet, -1), unet_blk.unsqueeze(0).expand(B, -1, -1)], dim=-1)
         )  # (B, n_unet, rank_unet^2)
 
         return vae_embeds, unet_embeds
@@ -334,10 +334,7 @@ class S3DiffPipeline(DiffusionPipeline):
             filename (str): Name of the checkpoint file. Default: ``"s3diff.pkl"``.
         """
         if not is_peft_available():
-            raise ImportError(
-                "PEFT is required to load S3Diff weights. "
-                "Install it with: pip install peft"
-            )
+            raise ImportError("PEFT is required to load S3Diff weights. Install it with: pip install peft")
 
         import os
 
@@ -391,6 +388,7 @@ class S3DiffPipeline(DiffusionPipeline):
         self.vae.load_state_dict(_sd_vae)
         # PEFT initialises LoRA weights on CPU; move everything back to the target device.
         self.vae.to(device=device, dtype=dtype)
+        self.vae.enable_tiling()
 
         # ---- UNet LoRA -----------------------------------------------
         rank_unet = sd["rank_unet"]
@@ -669,10 +667,7 @@ class S3DiffPipeline(DiffusionPipeline):
 
         if isinstance(image, list) and isinstance(image[0], PIL.Image.Image):
             image = torch.stack(
-                [
-                    torch.from_numpy(np.array(img.convert("RGB"))).permute(2, 0, 1).float() / 255.0
-                    for img in image
-                ],
+                [torch.from_numpy(np.array(img.convert("RGB"))).permute(2, 0, 1).float() / 255.0 for img in image],
                 dim=0,
             )
         elif isinstance(image, np.ndarray):
@@ -753,21 +748,19 @@ class S3DiffPipeline(DiffusionPipeline):
             pos_model_pred = self.unet(lq_latent, timesteps, encoder_hidden_states=pos_embeds).sample
             if use_cfg:
                 neg_model_pred = self.unet(lq_latent, timesteps, encoder_hidden_states=neg_embeds).sample
+                model_pred = neg_model_pred + effective_guidance_scale * (pos_model_pred - neg_model_pred)
+            else:
+                model_pred = pos_model_pred
         else:
-            pos_model_pred, neg_model_pred = self._tiled_unet_forward(
+            model_pred = self._tiled_unet_forward(
                 lq_latent,
                 timesteps,
                 pos_embeds,
                 neg_embeds if use_cfg else None,
+                effective_guidance_scale,
                 latent_tiled_size,
                 latent_tiled_overlap,
             )
-
-        # Apply CFG
-        if use_cfg:
-            model_pred = neg_model_pred + effective_guidance_scale * (pos_model_pred - neg_model_pred)
-        else:
-            model_pred = pos_model_pred
 
         # Callback
         if callback is not None and 0 % callback_steps == 0:
@@ -777,7 +770,10 @@ class S3DiffPipeline(DiffusionPipeline):
         x_denoised = self.scheduler.step(model_pred, timesteps[0], lq_latent, return_dict=True).prev_sample
 
         # ---- Decode to pixel space -----------------------------------
-        output_image = (self.vae.decode(x_denoised / self.vae.config.scaling_factor).sample).clamp(-1.0, 1.0)
+        vae_dtype = next(self.vae.parameters()).dtype
+        output_image = (self.vae.decode((x_denoised / self.vae.config.scaling_factor).to(vae_dtype)).sample).clamp(
+            -1.0, 1.0
+        )
 
         # Crop back to the target size (remove padding)
         output_image = output_image[:, :, :resize_h, :resize_w]
@@ -802,93 +798,35 @@ class S3DiffPipeline(DiffusionPipeline):
     # Tiled UNet forward (for large images)
     # ------------------------------------------------------------------
 
-    def _gaussian_weights(
-        self, tile_width: int, tile_height: int, nbatches: int, device: torch.device
-    ) -> torch.Tensor:
-        """Generate a 2-D Gaussian weight mask for tile blending.
-
-        Always computed in fp32 to avoid underflow with small variance values
-        in fp16/bf16 (the peaked Gaussian with var=0.01 produces values < 1e-5
-        at tile edges, which underflow to zero in half precision).
-        """
-        var = 0.01
-        midpoint_x = (tile_width - 1) / 2.0
-        midpoint_y = (tile_height - 1) / 2.0
-        x_probs = [
-            math.exp(-((x - midpoint_x) ** 2) / (tile_width**2) / (2 * var))
-            / math.sqrt(2 * math.pi * var)
-            for x in range(tile_width)
-        ]
-        y_probs = [
-            math.exp(-((y - midpoint_y) ** 2) / (tile_height**2) / (2 * var))
-            / math.sqrt(2 * math.pi * var)
-            for y in range(tile_height)
-        ]
-        weights = torch.tensor(np.outer(y_probs, x_probs), dtype=torch.float32, device=device)
-        return weights.unsqueeze(0).unsqueeze(0).expand(nbatches, self.unet.config.in_channels, -1, -1)
-
     def _tiled_unet_forward(
         self,
         lq_latent: torch.Tensor,
         timesteps: torch.Tensor,
         pos_embeds: torch.Tensor,
         neg_embeds: Optional[torch.Tensor],
+        guidance_scale: float,
         tile_size: int,
         tile_overlap: int,
-    ):
-        """Run UNet inference using tiling for large latents.
-
-        Accumulation is done in fp32 to prevent numerical issues when the
-        model runs in fp16/bf16.
-
-        Returns:
-            Tuple of ``(pos_model_pred, neg_model_pred)`` where ``neg_model_pred``
-            is ``None`` when ``neg_embeds`` is ``None``.
-        """
-        input_dtype = lq_latent.dtype
-        _, _, h, w = lq_latent.shape
+    ) -> torch.Tensor:
+        """Run UNet inference using Fliser tiling for large latents."""
+        _, c, h, w = lq_latent.shape
         tile_size = min(tile_size, min(h, w))
-        tile_weights = self._gaussian_weights(tile_size, tile_size, 1, lq_latent.device)
 
-        def _compute_grid(dim_size):
-            count, cur = 0, 0
-            while cur < dim_size:
-                cur = max(count * tile_size - tile_overlap * count, 0) + tile_size
-                count += 1
-            return count
+        fliser = Fliser(
+            image_size=(h, w),
+            num_channels=c,
+            tile_size=(tile_size, tile_size),
+            min_overlap=tile_overlap,
+            device=lq_latent.device,
+        )
 
-        grid_cols = _compute_grid(h)
-        grid_rows = _compute_grid(w)
+        for tile in tqdm(fliser.tiles(), desc="Processing tiles", leave=False):
+            pos_pred = self.unet(lq_latent[tile.slice()], timesteps, encoder_hidden_states=pos_embeds).sample
+            if neg_embeds is not None:
+                neg_pred = self.unet(lq_latent[tile.slice()], timesteps, encoder_hidden_states=neg_embeds).sample
+                pred = neg_pred + guidance_scale * (pos_pred - neg_pred)
+            else:
+                pred = pos_pred
+            fliser.update(tile, pred)
 
-        # Accumulate in fp32 to avoid precision loss
-        pos_noise_pred = torch.zeros(*lq_latent.shape, device=lq_latent.device, dtype=torch.float32)
-        neg_noise_pred = torch.zeros_like(pos_noise_pred) if neg_embeds is not None else None
-        contributors = torch.zeros_like(pos_noise_pred)
-
-        for row in range(grid_rows):
-            for col in range(grid_cols):
-                ofs_x = max(row * tile_size - tile_overlap * row, 0)
-                ofs_y = max(col * tile_size - tile_overlap * col, 0)
-                if row == grid_rows - 1:
-                    ofs_x = w - tile_size
-                if col == grid_cols - 1:
-                    ofs_y = h - tile_size
-
-                sx, ex = ofs_x, ofs_x + tile_size
-                sy, ey = ofs_y, ofs_y + tile_size
-                tile = lq_latent[:, :, sy:ey, sx:ex]
-
-                pos_out = self.unet(tile, timesteps, encoder_hidden_states=pos_embeds).sample
-                pos_noise_pred[:, :, sy:ey, sx:ex] += pos_out.float() * tile_weights
-
-                if neg_embeds is not None:
-                    neg_out = self.unet(tile, timesteps, encoder_hidden_states=neg_embeds).sample
-                    neg_noise_pred[:, :, sy:ey, sx:ex] += neg_out.float() * tile_weights
-
-                contributors[:, :, sy:ey, sx:ex] += tile_weights
-
-        pos_noise_pred /= contributors
-        if neg_noise_pred is not None:
-            neg_noise_pred /= contributors
-
-        return pos_noise_pred.to(input_dtype), neg_noise_pred.to(input_dtype) if neg_noise_pred is not None else None
+        return fliser.compute()
